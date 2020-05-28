@@ -51,7 +51,7 @@ def run(dataset, data_dir, result_dir, config_id, num_gpus, total_kimg, gamma, m
     train.mirror_augment = mirror_augment
     train.image_snapshot_ticks = train.network_snapshot_ticks = 10
     sched.G_lrate_base = sched.D_lrate_base = 0.002
-    sched.minibatch_size_base = 32
+    sched.minibatch_size_base = 8
     sched.minibatch_gpu_base = 4
     D_loss.gamma = 10
     metrics = [metric_defaults[x] for x in metrics]
@@ -85,9 +85,9 @@ def run(dataset, data_dir, result_dir, config_id, num_gpus, total_kimg, gamma, m
     if config_id in ['config-a', 'config-b', 'config-c', 'config-d']:
         sched.lod_initial_resolution = 8
         sched.G_lrate_base = sched.D_lrate_base = 0.001
-        sched.G_lrate_dict = sched.D_lrate_dict = {128: 0.0015, 256: 0.002, 512: 0.003, 1024: 0.003}
+        sched.G_lrate_dict = sched.D_lrate_dict = {128: 0.0015, 256: 0.002}
         sched.minibatch_size_base = 32 # (default)
-        sched.minibatch_size_dict = {8: 256, 16: 128, 32: 64, 64: 32}
+        sched.minibatch_size_dict = {8: 128, 16: 64, 32: 32, 64: 16}
         sched.minibatch_gpu_base = 4 # (default)
         sched.minibatch_gpu_dict = {8: 32, 16: 16, 32: 8, 64: 4}
         G.synthesis_func = 'G_synthesis_stylegan_revised'

@@ -400,6 +400,7 @@ class Network:
             with tfutil.absolute_name_scope(self.scope + "/_Run"), tf.control_dependencies(None):
                 with tf.device("/cpu:0"):
                     in_expr = [tf.placeholder(tf.float32, name=name) for name in self.input_names]
+                    print(self.input_names)
                     in_split = list(zip(*[tf.split(x, num_gpus) for x in in_expr]))
 
                 out_split = []

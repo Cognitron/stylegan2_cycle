@@ -151,6 +151,9 @@ def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
 def G_main(
     latents_in,                                         # First input: Latent vectors (Z) [minibatch, latent_size].
     labels_in,                                          # Second input: Conditioning labels [minibatch, label_size].
+    images_in,                                          # First input: Images [minibatch, channel, height, width].
+    num_channels            = 3,                        # Number of input color channels. Overridden based on dataset.
+    resolution              = 1024,                     # Input resolution. Overridden based on dataset.
     truncation_psi          = 0.5,                      # Style strength multiplier for the truncation trick. None = disable.
     truncation_cutoff       = None,                     # Number of layers for which to apply the truncation trick. None = disable.
     truncation_psi_val      = None,                     # Value for truncation_psi to use during validation.
@@ -162,8 +165,10 @@ def G_main(
     return_dlatents         = False,                    # Return dlatents in addition to the images?
     is_template_graph       = False,                    # True = template graph constructed by the Network class, False = actual evaluation.
     components              = dnnlib.EasyDict(),        # Container for sub-networks. Retained between calls.
+    encode_func             = 'G_encode',               # Build func name for the encode network.
     mapping_func            = 'G_mapping',              # Build func name for the mapping network.
     synthesis_func          = 'G_synthesis_stylegan2',  # Build func name for the synthesis network.
+    dtype                   = 'float32',                # Data type to use for activations and outputs.
     **kwargs):                                          # Arguments for sub-networks (mapping and synthesis).
 
     # Validate arguments.
@@ -181,9 +186,15 @@ def G_main(
     if not is_training or (style_mixing_prob is not None and not tflib.is_tf_expression(style_mixing_prob) and style_mixing_prob <= 0):
         style_mixing_prob = None
 
+    images_in.set_shape([None, num_channels, resolution, resolution])
+    images_in = tf.cast(images_in, dtype)
+    print('G_main >>>>>>>>>>>>>>>>>>>', resolution)
+
     # Setup components.
+    #if 'encode_func' not in components:
+    #    components.encode = tflib.Network('G_encode', func_name=globals()[G_encode], resolution=resolution, **kwargs)
     if 'synthesis' not in components:
-        components.synthesis = tflib.Network('G_synthesis', func_name=globals()[synthesis_func], **kwargs)
+        components.synthesis = tflib.Network('G_synthesis', func_name=globals()[synthesis_func], resolution=resolution, **kwargs)
     num_layers = components.synthesis.input_shape[1]
     dlatent_size = components.synthesis.input_shape[2]
     if 'mapping' not in components:
@@ -235,7 +246,7 @@ def G_main(
     if 'lod' in components.synthesis.vars:
         deps.append(tf.assign(components.synthesis.vars['lod'], lod_in))
     with tf.control_dependencies(deps):
-        images_out = components.synthesis.get_output_for(dlatents, is_training=is_training, force_clean_graph=is_template_graph, **kwargs)
+        images_out = components.synthesis.get_output_for(dlatents, resolution=resolution, is_training=is_training, force_clean_graph=is_template_graph, **kwargs)
 
     # Return requested outputs.
     images_out = tf.identity(images_out, name='images_out')
@@ -438,7 +449,7 @@ def G_synthesis_stylegan2(
     act = nonlinearity
     num_layers = resolution_log2 * 2 - 2
     images_out = None
-
+    print('G_synthesis_stylegan2 >>>>>>>>>>>>>>>>>>>', resolution)
     # Primary inputs.
     dlatents_in.set_shape([None, num_layers, dlatent_size])
     dlatents_in = tf.cast(dlatents_in, dtype)
@@ -693,5 +704,98 @@ def D_stylegan2(
     assert scores_out.dtype == tf.as_dtype(dtype)
     scores_out = tf.identity(scores_out, name='scores_out')
     return scores_out
+
+#----------------------------------------------------------------------------
+def G_encode(
+    images_in,                          # First input: Images [minibatch, channel, height, width].
+    labels_in,                          # Second input: Labels [minibatch, label_size].
+    num_channels        = 3,            # Number of input color channels. Overridden based on dataset.
+    resolution          = 1024,         # Input resolution. Overridden based on dataset.
+    label_size          = 0,            # Dimensionality of the labels, 0 if no labels. Overridden based on dataset.
+    fmap_base           = 16 << 10,     # Overall multiplier for the number of feature maps.
+    fmap_decay          = 1.0,          # log2 feature map reduction when doubling the resolution.
+    fmap_min            = 1,            # Minimum number of feature maps in any layer.
+    fmap_max            = 512,          # Maximum number of feature maps in any layer.
+    architecture        = 'resnet',     # Architecture: 'orig', 'skip', 'resnet'.
+    nonlinearity        = 'lrelu',      # Activation function: 'relu', 'lrelu', etc.
+    mbstd_group_size    = 4,            # Group size for the minibatch standard deviation layer, 0 = disable.
+    mbstd_num_features  = 1,            # Number of features for the minibatch standard deviation layer.
+    dtype               = 'float32',    # Data type to use for activations and outputs.
+    resample_kernel     = [1,3,3,1],    # Low-pass filter to apply when resampling activations. None = no filtering.
+    **_kwargs):                         # Ignore unrecognized keyword args.
+
+    resolution_log2 = int(np.log2(resolution))
+    assert resolution == 2**resolution_log2 and resolution >= 4
+    def nf(stage): return np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
+    assert architecture in ['orig', 'skip', 'resnet']
+    act = nonlinearity
+
+    images_in.set_shape([None, num_channels, resolution, resolution])
+    labels_in.set_shape([None, label_size])
+    images_in = tf.cast(images_in, dtype)
+    labels_in = tf.cast(labels_in, dtype)
+
+    # Building blocks for main layers.
+    def fromrgb(x, y, res): # res = 2..resolution_log2
+        with tf.variable_scope('FromRGB'):
+            t = apply_bias_act(conv2d_layer(y, fmaps=nf(res-1), kernel=1), act=act)
+            return t if x is None else x + t
+    def block(x, res): # res = 2..resolution_log2
+        t = x
+        with tf.variable_scope('Conv0'):
+            x = apply_bias_act(conv2d_layer(x, fmaps=nf(res-1), kernel=3), act=act)
+        with tf.variable_scope('Conv1_down'):
+            x = apply_bias_act(conv2d_layer(x, fmaps=nf(res-2), kernel=3, down=True, resample_kernel=resample_kernel), act=act)
+        if architecture == 'resnet':
+            with tf.variable_scope('Skip'):
+                t = conv2d_layer(t, fmaps=nf(res-2), kernel=1, down=True, resample_kernel=resample_kernel)
+                x = (x + t) * (1 / np.sqrt(2))
+        return x
+    def downsample(y):
+        with tf.variable_scope('Downsample'):
+            return downsample_2d(y, k=resample_kernel)
+
+    # Main layers.
+    x = None
+    y = images_in
+    for res in range(resolution_log2, 2, -1):
+        with tf.variable_scope('%dx%d' % (2**res, 2**res)):
+            if architecture == 'skip' or res == resolution_log2:
+                x = fromrgb(x, y, res)
+            x = block(x, res)
+            if architecture == 'skip':
+                y = downsample(y)
+
+    # Final layers.
+    with tf.variable_scope('4x4'):
+        if architecture == 'skip':
+            x = fromrgb(x, y, 2)
+        if mbstd_group_size > 1:
+            with tf.variable_scope('MinibatchStddev'):
+                x = minibatch_stddev_layer(x, mbstd_group_size, mbstd_num_features)
+        with tf.variable_scope('Conv'):
+            x = apply_bias_act(conv2d_layer(x, fmaps=nf(1), kernel=3), act=act)
+        with tf.variable_scope('Dense0'):
+            x = apply_bias_act(dense_layer(x, fmaps=nf(0)), act=act)
+
+    # Normalize latents.
+    if normalize_latents:
+        with tf.variable_scope('Normalize'):
+            x *= tf.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + 1e-8)
+
+    # Mapping layers.
+    for layer_idx in range(4):
+        with tf.variable_scope('Dense%d' % layer_idx):
+            fmaps = dlatent_size if layer_idx == 4 - 1 else mapping_fmaps
+            x = apply_bias_act(dense_layer(x, fmaps=fmaps, lrmul=mapping_lrmul), act=act, lrmul=mapping_lrmul)
+
+    # Broadcast.
+    if dlatent_broadcast is not None:
+        with tf.variable_scope('Broadcast'):
+            x = tf.tile(x[:, np.newaxis], [1, dlatent_broadcast, 1])
+
+    # Output.
+    assert x.dtype == tf.as_dtype(dtype)
+    return tf.identity(x, name='encode')
 
 #----------------------------------------------------------------------------
